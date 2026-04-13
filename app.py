@@ -5,115 +5,112 @@ import io
 st.set_page_config(page_title="Universal MIS Tool", page_icon="📊", layout="wide")
 
 st.title("📊 Universal Monthly Variance Analyzer")
-st.markdown("Upload any Tally report (CSV or Excel). This tool automatically maps months for any client.")
+st.markdown("Upload any Tally report. This version is optimized to find months even in messy files.")
 
-# 1. SUPPORT BOTH FORMATS
 uploaded_file = st.file_uploader("Upload Master Trial Balance", type=["csv", "xlsx"])
 
 if uploaded_file:
     try:
-        # 2. LOAD DATA SAFELY
+        # 1. LOAD DATA
         if uploaded_file.name.endswith('.csv'):
             df_raw = pd.read_csv(uploaded_file, header=None).fillna("")
         else:
             df_raw = pd.read_excel(uploaded_file, header=None).fillna("")
 
-        # 3. SCAN FOR DATA START
-        # We look for 'Particulars' anywhere in the file
-        header_row = None
+        # 2. FIND THE DATA START (Search for 'Particulars')
+        header_row_idx = None
         for i in range(len(df_raw)):
             if any("Particulars" in str(val) for val in df_raw.iloc[i].values):
-                header_row = i
+                header_row_idx = i
                 break
 
-        if header_row is None:
-            st.error("Could not find 'Particulars' column. Please check the export format.")
+        if header_row_idx is None:
+            st.error("Could not find 'Particulars' column. Please check your Tally export.")
             st.stop()
 
-        # 4. DYNAMIC MONTH DETECTION
-        # We look 1-3 rows above Particulars to find Month names
-        possible_month_rows = [header_row-1, header_row-2, header_row-3]
-        months_row = []
-        for r in possible_month_rows:
-            if r >= 0:
-                row_vals = [str(v).strip() for v in df_raw.iloc[r] if str(v).strip() not in ["", "nan"]]
-                if len(row_vals) > 1: # Found the row with month names
-                    months_row = df_raw.iloc[r].tolist()
-                    break
-
-        sub_headers = df_raw.iloc[header_row].tolist()
+        # 3. ROBUST HEADER EXTRACTION
+        # We check 3 rows above for months. If we find nothing, we use generic labels.
+        sub_headers = [str(s).strip() for s in df_raw.iloc[header_row_idx].tolist()]
         
-        # Forward-fill month names (e.g., 'Feb' applies to its Debit, Credit, Balance)
-        current_m = "Opening"
+        # Try to find the most 'word-heavy' row above headers to use as months
+        best_month_row = []
+        max_words = 0
+        for r in range(max(0, header_row_idx-3), header_row_idx):
+            row_content = [str(v).strip() for v in df_raw.iloc[r] if len(str(v).strip()) > 2]
+            if len(row_content) > max_words:
+                max_words = len(row_content)
+                best_month_row = df_raw.iloc[r].tolist()
+
+        # Build final column names
+        current_m = "Data"
         final_cols = []
-        for m, s in zip(months_row, sub_headers):
+        for i, (m, s) in enumerate(zip(best_month_row if best_month_row else [""]*len(sub_headers), sub_headers)):
             m_str = str(m).strip()
             s_str = str(s).strip()
-            if m_str and m_str.lower() != "nan":
+            
+            if m_str and m_str.lower() != "nan" and len(m_str) > 2:
                 current_m = m_str
             
             if s_str == "Particulars":
                 final_cols.append("Particulars")
             elif s_str and s_str.lower() != "nan":
-                final_cols.append(f"{current_m} - {s_str}")
+                # Create a unique name: Month + Subheader + Index (to avoid duplicates)
+                final_cols.append(f"{current_m} - {s_str} ({i})")
             else:
-                final_cols.append(f"Empty_{len(final_cols)}")
+                final_cols.append(f"Empty_{i}")
 
-        # 5. PREPARE DATAFRAME
-        df_clean = df_raw.iloc[header_row + 1:].copy()
+        # 4. PREPARE DATAFRAME
+        df_clean = df_raw.iloc[header_row_idx + 1:].copy()
         df_clean.columns = final_cols
-        # Remove garbage columns
-        df_clean = df_clean.loc[:, ~df_clean.columns.str.contains('Empty_|^0$')]
+        df_clean = df_clean.loc[:, ~df_clean.columns.str.contains('Empty_')]
         
-        # 6. DYNAMIC DROPDOWNS
-        # We filter for 'Balance' so the user only picks the final monthly figures
-        bal_cols = [c for c in df_clean.columns if 'Balance' in c]
+        # Identify columns for the dropdown
+        # We look for anything that looks like a Balance or Closing
+        compare_options = [c for c in df_clean.columns if "Particulars" not in c]
         
-        st.sidebar.header("Select Months to Compare")
-        m1 = st.sidebar.selectbox("Base Month (Older)", bal_cols, index=0)
-        m2 = st.sidebar.selectbox("Comparison Month (Newer)", bal_cols, index=len(bal_cols)-1)
+        # 5. SIDEBAR
+        st.sidebar.header("Select Columns")
+        m1 = st.sidebar.selectbox("Base Column (Older)", compare_options, index=0)
+        m2 = st.sidebar.selectbox("Comparison Column (Newer)", compare_options, index=len(compare_options)-1)
 
-        # 7. CURRENCY CLEANING FUNCTION
-        def clean_fin_val(x):
+        # 6. MATH ENGINE
+        def clean_val(x):
             try:
                 s = str(x).replace(' Dr', '').replace(' Cr', '').replace(',', '').strip()
                 return float(s)
             except: return 0.0
 
-        # 8. PROCESS ANALYSIS
         report = df_clean[['Particulars', m1, m2]].copy()
-        report[m1] = report[m1].apply(clean_fin_val)
-        report[m2] = report[m2].apply(clean_fin_val)
-        report['Variance'] = report[m2] - report[m1]
-        report['% Change'] = (report['Variance'] / report[m1].replace(0, 1))
+        report.columns = ['Particulars', 'Old_Period', 'New_Period']
+        report['Old_Period'] = report['Old_Period'].apply(clean_val)
+        report['New_Period'] = report['New_Period'].apply(clean_val)
+        report['Variance'] = report['New_Period'] - report['Old_Period']
+        report['% Change'] = (report['Variance'] / report['Old_Period'].replace(0, 1))
 
-        # 9. DISPLAY & EXPORT
-        st.subheader(f"Results for {m2} vs {m1}")
-        st.dataframe(report, use_container_width=True)
+        # Rename back for display
+        display_report = report.copy()
+        display_report.columns = ['Particulars', m1, m2, 'Variance', '% Change']
+
+        # 7. OUTPUT
+        st.subheader(f"Comparison: {m1} vs {m2}")
+        st.dataframe(display_report, use_container_width=True)
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            report.to_excel(writer, sheet_name='Variance_Report', index=False)
-            wb, ws = writer.book, writer.sheets['Variance_Report']
+            display_report.to_excel(writer, sheet_name='MIS_Variance', index=False)
+            wb, ws = writer.book, writer.sheets['MIS_Variance']
             
-            # Formats
-            hdr_f = wb.add_format({'bold': True, 'bg_color': '#D9EAD3', 'border': 1})
-            num_f = wb.add_format({'num_format': '#,##0.00', 'border': 1})
-            pct_f = wb.add_format({'num_format': '0.0%', 'border': 1})
-            red_f = wb.add_format({'bg_color': '#F4CCCC', 'font_color': '#990000'})
-            grn_f = wb.add_format({'bg_color': '#D9EAD3', 'font_color': '#38761D'})
-
+            hdr = wb.add_format({'bold': True, 'bg_color': '#D9EAD3', 'border': 1})
+            num = wb.add_format({'num_format': '#,##0.00', 'border': 1})
+            pct = wb.add_format({'num_format': '0.0%', 'border': 1})
+            
             ws.set_column('A:A', 45)
-            ws.set_column('B:D', 18, num_f)
-            ws.set_column('E:E', 12, pct_f)
+            ws.set_column('B:D', 18, num)
+            ws.set_column('E:E', 12, pct)
+            for i, col in enumerate(display_report.columns):
+                ws.write(0, i, col, hdr)
 
-            for i, col in enumerate(report.columns):
-                ws.write(0, i, col, hdr_f)
-
-            ws.conditional_format(1, 3, len(report), 3, {'type': 'cell', 'criteria': '>', 'value': 0, 'format': red_f})
-            ws.conditional_format(1, 3, len(report), 3, {'type': 'cell', 'criteria': '<', 'value': 0, 'format': grn_f})
-
-        st.download_button("📥 Download Excel Report", output.getvalue(), "MIS_Variance_Report.xlsx")
+        st.download_button("📥 Download Excel Report", output.getvalue(), "MIS_Variance.xlsx")
 
     except Exception as e:
-        st.error(f"Processing Error: {e}")
+        st.error(f"Something went wrong: {e}")
